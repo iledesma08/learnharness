@@ -122,6 +122,48 @@ test("spawnAcpClient handles initialize, session/new metadata/disabledTools, con
 	}
 });
 
+test("spawnAcpClient selects allow_once only when approvePermission returns true", async () => {
+	const root = makeTempRoot();
+	const geminiHome = path.join(root, "profile");
+	const tempDir = path.join(root, "tmp");
+	const cwd = path.join(root, "cwd");
+	fs.mkdirSync(geminiHome, { recursive: true });
+	fs.mkdirSync(tempDir, { recursive: true });
+	fs.mkdirSync(cwd, { recursive: true });
+
+	const env = buildAntigravityEnvironment({
+		baseEnv: {
+			...process.env,
+			FAKE_ACP_RECORD_EVENTS: "1",
+			FAKE_ACP_STREAM_MODE: "permission-then-text",
+		},
+		geminiHome,
+		tempDir,
+		harnessPath: "/tmp/lh_harness",
+	});
+
+	const client = spawnAcpClient({
+		cwd,
+		env,
+		runtime: { executablePath: FAKE_ACP, args: [], version: "1.4.5" },
+		approvePermission: () => true,
+	});
+
+	try {
+		await client.initialize(5_000);
+		const sess = await client.sessionNew({ cwd, mcpServers: [] }, 5_000);
+		await client.prompt(sess.sessionId, [{ type: "text", text: "Hi" }], 5_000);
+		const recordedPerm = JSON.parse(
+			fs.readFileSync(path.join(geminiHome, "antigravity-acp", "last-permission-response.json"), "utf8"),
+		) as { result?: { outcome?: { outcome?: string; optionId?: string } } };
+		assert.equal(recordedPerm.result?.outcome?.outcome, "selected");
+		assert.equal(recordedPerm.result?.outcome?.optionId, "allow_once");
+	} finally {
+		await client.close();
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test("spawnAcpClient surfaces AcpRpcError with IPv6 context on Linux stderr failure", async () => {
 	const root = makeTempRoot();
 	const geminiHome = path.join(root, "profile");

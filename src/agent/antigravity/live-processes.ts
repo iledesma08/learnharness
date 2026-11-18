@@ -146,6 +146,20 @@ export function getActiveAntigravityProcessCount(): number {
 	return activeRegistry().size;
 }
 
+/** Releases and terminates any parked Antigravity ACP process belonging to a finished ephemeral session (e.g. subagents). */
+export async function releaseParkedAntigravitySession(sessionId: string | undefined): Promise<void> {
+	if (!sessionId) return;
+	const matches: LiveAntigravityProcess[] = [];
+	for (const proc of parkedRegistry().keys()) {
+		if (proc.sessionId === sessionId) matches.push(proc);
+	}
+	if (matches.length === 0) return;
+	for (const proc of matches) {
+		unparkAntigravityProcess(proc);
+	}
+	await Promise.allSettled(matches.map((proc) => proc.kill()));
+}
+
 /** Closes and cleans up all active and parked Antigravity ACP processes. */
 export async function shutdownAntigravityProcesses(): Promise<void> {
 	const processes = new Set<LiveAntigravityProcess>([...activeRegistry(), ...parkedRegistry().keys()]);

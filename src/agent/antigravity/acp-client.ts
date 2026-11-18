@@ -204,7 +204,17 @@ export type AcpSessionUpdate =
 
 export interface AcpPermissionRequestParams {
 	sessionId?: string;
-	toolCall?: { toolCallId?: string; title?: string; kind?: string; [key: string]: unknown };
+	toolCall?: {
+		toolCallId?: string;
+		title?: string;
+		kind?: string;
+		_meta?: {
+			is_mcp_tool_call?: unknown;
+			mcp?: { server?: unknown; tool?: unknown };
+			[key: string]: unknown;
+		};
+		[key: string]: unknown;
+	};
 	options?: Array<{ optionId?: string; name?: string; kind?: string }>;
 	[key: string]: unknown;
 }
@@ -271,6 +281,7 @@ export interface CreateAcpClientOptions {
 	spawnProcess?: typeof spawn;
 	onSessionUpdate?: (sessionId: string | undefined, update: AcpSessionUpdate) => void;
 	onPermissionRequest?: (params: AcpPermissionRequestParams) => void;
+	approvePermission?: (params: AcpPermissionRequestParams) => boolean;
 	onStderrLine?: (line: string) => void;
 	onClose?: (code: number | null, signal: NodeJS.Signals | null, stderrTail: string) => void;
 	onError?: (error: Error) => void;
@@ -390,16 +401,29 @@ export function spawnAcpClient(options: CreateAcpClientOptions): AcpClient {
 
 	const handleIncomingRequest = (id: string | number, method: string, params: Record<string, unknown> | undefined) => {
 		if (method === "session/request_permission") {
-			// Security boundary: LearnHarness owns tool admission via MCP; unconditionally decline native permissions.
+			// Security boundary: LearnHarness owns tool admission via MCP; decline native/unapproved permissions.
+			const permissionParams = (params ?? {}) as AcpPermissionRequestParams;
 			try {
-				options.onPermissionRequest?.((params ?? {}) as AcpPermissionRequestParams);
+				options.onPermissionRequest?.(permissionParams);
 			} catch {
 				// Observer errors must never allow permission grants.
 			}
+			let approved = false;
+			try {
+				approved = options.approvePermission?.(permissionParams) === true;
+			} catch {
+				approved = false;
+			}
+			const allowOption = approved
+				? (permissionParams.options?.find((o) => o?.kind === "allow_once" && typeof o.optionId === "string" && o.optionId.trim()) ??
+					permissionParams.options?.find((o) => o?.kind === "allow_always" && typeof o.optionId === "string" && o.optionId.trim()))
+				: undefined;
 			sendRaw({
 				jsonrpc: "2.0",
 				id,
-				result: { outcome: { outcome: "cancelled" } },
+				result: allowOption?.optionId
+					? { outcome: { outcome: "selected", optionId: allowOption.optionId } }
+					: { outcome: { outcome: "cancelled" } },
 			});
 			return;
 		}
