@@ -8,7 +8,8 @@ import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import type { ResolvedAntigravityRuntime } from "../src/agent/antigravity/installation.ts";
 import { antigravityTokenFilePath, ensureAntigravityProfile } from "../src/agent/antigravity/profile.ts";
 import { toPiAntigravityModel } from "../src/agent/antigravity/provider.ts";
-import { createAntigravityStream } from "../src/agent/antigravity/stream.ts";
+import { createAntigravityStream, isDeclaredLearnHarnessMcpPermission, shutdownAntigravityProcesses } from "../src/agent/antigravity/stream.ts";
+import { measuredContextTokens } from "../src/core/context-usage.ts";
 import type { LhMessage } from "../src/core/native-messages.ts";
 
 const FAKE_ACP = path.resolve(import.meta.dirname, "fixtures", "antigravity", "fake-acp.mjs");
@@ -116,6 +117,7 @@ test("createAntigravityStream translates thinking/text chunks, usage, cliContext
 		assert.equal(finalMsg.usage.cacheWrite, 5);
 		assert.equal(finalMsg.usage.totalTokens, 140);
 		assert.equal(finalMsg.usage.cost.total, 0);
+		assert.equal(measuredContextTokens([{ ...finalMsg, id: "m1" } as unknown as LhMessage]), 150);
 		assert.equal(finalMsg.cliContextWindow, 512000);
 
 		const recordedSession = JSON.parse(
@@ -323,6 +325,387 @@ test("createAntigravityStream unconditionally declines session/request_permissio
 		assert.equal(ipv6Err.type, "error");
 		assert.match(ipv6Err.error.errorMessage ?? "", /Linux.*IPv6/i);
 	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("isDeclaredLearnHarnessMcpPermission authorizes only declared learnharness MCP tools on the active session", () => {
+	const declared = new Set(["submit_findings", "read"]);
+	assert.equal(
+		isDeclaredLearnHarnessMcpPermission(
+			{
+				sessionId: "sess-1",
+				toolCall: { _meta: { is_mcp_tool_call: true, mcp: { server: "learnharness", tool: "submit_findings" } } },
+			},
+			declared,
+			"sess-1",
+		),
+		true,
+	);
+	// Rejects native tool (missing _meta.is_mcp_tool_call)
+	assert.equal(
+		isDeclaredLearnHarnessMcpPermission(
+			{ sessionId: "sess-1", toolCall: { title: "learnharness_submit_findings" } },
+			declared,
+			"sess-1",
+		),
+		false,
+	);
+	// Rejects external MCP server
+	assert.equal(
+		isDeclaredLearnHarnessMcpPermission(
+			{
+				sessionId: "sess-1",
+				toolCall: { _meta: { is_mcp_tool_call: true, mcp: { server: "other", tool: "submit_findings" } } },
+			},
+			declared,
+			"sess-1",
+		),
+		false,
+	);
+	// Rejects undeclared tool name
+	assert.equal(
+		isDeclaredLearnHarnessMcpPermission(
+			{
+				sessionId: "sess-1",
+				toolCall: { _meta: { is_mcp_tool_call: true, mcp: { server: "learnharness", tool: "run_workflow" } } },
+			},
+			declared,
+			"sess-1",
+		),
+		false,
+	);
+	// Rejects mismatched session
+	assert.equal(
+		isDeclaredLearnHarnessMcpPermission(
+			{
+				sessionId: "sess-2",
+				toolCall: { _meta: { is_mcp_tool_call: true, mcp: { server: "learnharness", tool: "submit_findings" } } },
+			},
+			declared,
+			"sess-1",
+		),
+		false,
+	);
+});
+
+test("createAntigravityStream approves learnharness MCP permission requests and declines other MCP servers", async () => {
+	const root = makeTempRoot();
+	const authFile = path.join(root, "auth.json");
+
+	try {
+		const profileDir = ensureAntigravityProfile({ authFile, env: { ...process.env, LH_AUTH_FILE: authFile } });
+		fs.writeFileSync(antigravityTokenFilePath(profileDir), JSON.stringify({ token: "tok" }), { mode: 0o600 });
+
+		const tools = [
+			{
+				name: "submit_findings",
+				description: "Submit extracted findings",
+				parameters: Type.Object({ topic: Type.String() }),
+			},
+		];
+		const userMessage = { role: "user" as const, content: "Extract", timestamp: 1 };
+
+		// 1) Declared learnharness MCP tool requesting session/request_permission is allowed and admitted via bridge
+		const allowedEnv = {
+			...process.env,
+			LH_AUTH_FILE: authFile,
+			FAKE_ACP_RECORD_EVENTS: "1",
+			FAKE_ACP_STREAM_MODE: "mcp-tool",
+			FAKE_ACP_REQUIRE_MCP_PERMISSION: "1",
+			FAKE_ACP_TOOL_NAME: "submit_findings",
+			FAKE_ACP_TOOL_ARGS_JSON: JSON.stringify({ topic: "tcp" }),
+		};
+		const streamFn = createAntigravityStream({
+			isEnabled: () => true,
+			isSignedIn: () => true,
+			resolveRuntime: () => fakeRuntime("1.4.5"),
+			ensureProfile: () => profileDir,
+			env: allowedEnv,
+		});
+		const allowedStream = streamFn(
+			testModel(),
+			normalizeContext({ systemPrompt: "Extract.", messages: [userMessage], tools }),
+			{ sessionId: "chat-mcp-perm-ok" },
+		);
+		const step1Events = await collectEvents(allowedStream);
+		const step1Done = step1Events.at(-1) as Extract<AssistantMessageEvent, { type: "done" }>;
+		assert.equal(step1Done.reason, "toolUse");
+		const toolCall = step1Done.message.content.find((b) => b.type === "toolCall");
+		assert.ok(toolCall && toolCall.type === "toolCall");
+		assert.equal(toolCall.name, "submit_findings");
+
+		const recordedPerm = JSON.parse(
+			fs.readFileSync(path.join(profileDir, "antigravity-acp", "last-permission-response.json"), "utf8"),
+		) as { result?: { outcome?: { outcome?: string; optionId?: string } } };
+		assert.equal(recordedPerm.result?.outcome?.outcome, "selected");
+		assert.equal(recordedPerm.result?.outcome?.optionId, "allow");
+
+		// Finish turn cleanly so parked process closes
+		const step2Events = await collectEvents(
+			streamFn(
+				testModel(),
+				normalizeContext({
+					systemPrompt: "Extract.",
+					messages: [
+						userMessage,
+						step1Done.message,
+						{
+							role: "toolResult",
+							toolCallId: toolCall.id,
+							toolName: "submit_findings",
+							content: [{ type: "text", text: "ok" }],
+							isError: false,
+							timestamp: 2,
+						},
+					],
+					tools,
+				}),
+				{ sessionId: "chat-mcp-perm-ok" },
+			),
+		);
+		assert.equal((step2Events.at(-1) as Extract<AssistantMessageEvent, { type: "done" }>).reason, "stop");
+
+		// 2) External/spoofed MCP server requesting session/request_permission is declined
+		const deniedStream = createAntigravityStream({
+			isEnabled: () => true,
+			isSignedIn: () => true,
+			resolveRuntime: () => fakeRuntime("1.4.5"),
+			ensureProfile: () => profileDir,
+			env: {
+				...allowedEnv,
+				FAKE_ACP_MCP_SERVER_NAME: "rogue-server",
+			},
+		})(testModel(), normalizeContext({ systemPrompt: "Extract.", messages: [userMessage], tools }), {
+			sessionId: "chat-mcp-perm-denied",
+		});
+		const deniedEvents = await collectEvents(deniedStream);
+		const deniedDone = deniedEvents.at(-1) as Extract<AssistantMessageEvent, { type: "done" }>;
+		assert.equal(deniedDone.reason, "stop");
+		assert.equal((deniedDone.message.content[0] as { text?: string }).text, "mcp-permission:cancelled");
+	} finally {
+		await shutdownAntigravityProcesses();
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("createAntigravityStream prefers single-call usage_update.used over larger multi-call cumulative PromptResponse.usage", async () => {
+	const root = makeTempRoot();
+	const authFile = path.join(root, "auth.json");
+	const env = {
+		...process.env,
+		LH_AUTH_FILE: authFile,
+		FAKE_ACP_CLI_WINDOW: "1048576",
+		FAKE_ACP_USAGE_JSON: JSON.stringify({
+			inputTokens: 400,
+			outputTokens: 25,
+			cachedReadTokens: 350,
+			totalTokens: 425,
+		}),
+	};
+
+	try {
+		const profileDir = ensureAntigravityProfile({ authFile, env });
+		fs.writeFileSync(antigravityTokenFilePath(profileDir), JSON.stringify({ token: "tok" }), { mode: 0o600 });
+
+		const streamFn = createAntigravityStream({
+			isEnabled: () => true,
+			isSignedIn: () => true,
+			resolveRuntime: () => fakeRuntime("1.4.5"),
+			ensureProfile: () => profileDir,
+			env,
+		});
+
+		const stream = streamFn(
+			testModel(),
+			normalizeContext({
+				systemPrompt: "Teach calculus patiently.",
+				messages: [{ role: "user", content: "Explain derivatives.", timestamp: 1 }],
+				tools: [],
+			}),
+			{ reasoning: "high", sessionId: "chat-multicall-usage" },
+		);
+
+		const events = await collectEvents(stream);
+		const done = events.at(-1) as Extract<AssistantMessageEvent, { type: "done" }>;
+		assert.equal(done.reason, "stop");
+		const finalMsg = done.message as unknown as LhMessage & { usage: NonNullable<typeof done.message.usage> };
+		assert.equal(finalMsg.usage.input, 150);
+		assert.equal(finalMsg.usage.totalTokens, 150);
+		assert.equal(measuredContextTokens([{ ...finalMsg, id: "m-multi" }]), 150);
+		assert.equal(finalMsg.cliContextWindow, 1048576);
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("createAntigravityStream nudges once in-session on thinking-only stopReason=stop and recovers text or MCP toolCall", async () => {
+	const root = makeTempRoot();
+	const authFile = path.join(root, "auth.json");
+
+	try {
+		const profileDir = ensureAntigravityProfile({ authFile, env: { ...process.env, LH_AUTH_FILE: authFile } });
+		fs.writeFileSync(antigravityTokenFilePath(profileDir), JSON.stringify({ token: "tok" }), { mode: 0o600 });
+
+		// 1) Recovers into learner-facing text on the same ACP session
+		const textEnv = {
+			...process.env,
+			LH_AUTH_FILE: authFile,
+			FAKE_ACP_RECORD_EVENTS: "1",
+			FAKE_ACP_STREAM_MODE: "thinking-only-then-text",
+			FAKE_ACP_TEXT: "Recovered answer after thinking.",
+		};
+		const textStreamFn = createAntigravityStream({
+			isEnabled: () => true,
+			isSignedIn: () => true,
+			resolveRuntime: () => fakeRuntime("1.4.5"),
+			ensureProfile: () => profileDir,
+			env: textEnv,
+		});
+		const textEvents = await collectEvents(
+			textStreamFn(
+				testModel(),
+				normalizeContext({
+					systemPrompt: "Probe the learner.",
+					messages: [{ role: "user", content: "Teach me derivatives", timestamp: 1 }],
+					tools: [],
+				}),
+				{ reasoning: "high", sessionId: "chat-agy-nudge-text" },
+			),
+		);
+		const textDone = textEvents.at(-1) as Extract<AssistantMessageEvent, { type: "done" }>;
+		assert.equal(textDone.type, "done");
+		assert.equal(textDone.reason, "stop");
+		assert.equal(
+			textDone.message.content.find((b) => b.type === "text")?.type === "text"
+				? (textDone.message.content.find((b) => b.type === "text") as { text: string }).text
+				: "",
+			"Recovered answer after thinking.",
+		);
+
+		const historyLines = fs
+			.readFileSync(path.join(profileDir, "antigravity-acp", "prompt-history.jsonl"), "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as { sessionId: string; promptNumber: number; prompt: Array<{ text?: string }> });
+		assert.equal(historyLines.length, 2);
+		assert.equal(historyLines[0]?.sessionId, historyLines[1]?.sessionId);
+		assert.equal(historyLines[1]?.promptNumber, 2);
+		assert.match(historyLines[1]?.prompt[0]?.text ?? "", /thinking only/i);
+
+		// 2) Recovers into an MCP tool call and completes the held call normally
+		const mcpEnv = {
+			...process.env,
+			LH_AUTH_FILE: authFile,
+			FAKE_ACP_STREAM_MODE: "thinking-only-then-mcp-tool",
+			FAKE_ACP_TOOL_NAME: "probe_check",
+			FAKE_ACP_TOOL_ARGS_JSON: JSON.stringify({ topic: "limits" }),
+		};
+		const mcpStreamFn = createAntigravityStream({
+			isEnabled: () => true,
+			isSignedIn: () => true,
+			resolveRuntime: () => fakeRuntime("1.4.5"),
+			ensureProfile: () => profileDir,
+			env: mcpEnv,
+		});
+		const tools = [
+			{
+				name: "probe_check",
+				description: "Record learner understanding",
+				parameters: Type.Object({ topic: Type.String() }),
+			},
+		];
+		const userMessage = { role: "user" as const, content: "Test me", timestamp: 1 };
+		const step1Events = await collectEvents(
+			mcpStreamFn(testModel(), normalizeContext({ systemPrompt: "Probe.", messages: [userMessage], tools }), {
+				sessionId: "chat-agy-nudge-mcp",
+			}),
+		);
+		const step1Done = step1Events.at(-1) as Extract<AssistantMessageEvent, { type: "done" }>;
+		assert.equal(step1Done.type, "done");
+		assert.equal(step1Done.reason, "toolUse");
+		const toolCall = step1Done.message.content.find((b) => b.type === "toolCall");
+		assert.ok(toolCall && toolCall.type === "toolCall");
+		assert.equal(toolCall.name, "probe_check");
+
+		const step2Events = await collectEvents(
+			mcpStreamFn(
+				testModel(),
+				normalizeContext({
+					systemPrompt: "Probe.",
+					messages: [
+						userMessage,
+						step1Done.message,
+						{
+							role: "toolResult",
+							toolCallId: toolCall.id,
+							toolName: "probe_check",
+							content: [{ type: "text", text: "Recorded probe" }],
+							isError: false,
+							timestamp: 2,
+						},
+					],
+					tools,
+				}),
+				{ sessionId: "chat-agy-nudge-mcp" },
+			),
+		);
+		const step2Done = step2Events.at(-1) as Extract<AssistantMessageEvent, { type: "done" }>;
+		assert.equal(step2Done.reason, "stop");
+	} finally {
+		await shutdownAntigravityProcesses();
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("createAntigravityStream fails with stopReason=error after one nudge if output stays thinking-only or whitespace-only", async () => {
+	const root = makeTempRoot();
+	const authFile = path.join(root, "auth.json");
+
+	try {
+		const profileDir = ensureAntigravityProfile({ authFile, env: { ...process.env, LH_AUTH_FILE: authFile } });
+		fs.writeFileSync(antigravityTokenFilePath(profileDir), JSON.stringify({ token: "tok" }), { mode: 0o600 });
+
+		for (const streamMode of ["thinking-only-always", "thinking-whitespace-only"] as const) {
+			const historyPath = path.join(profileDir, "antigravity-acp", "prompt-history.jsonl");
+			fs.rmSync(historyPath, { force: true });
+
+			const streamFn = createAntigravityStream({
+				isEnabled: () => true,
+				isSignedIn: () => true,
+				resolveRuntime: () => fakeRuntime("1.4.5"),
+				ensureProfile: () => profileDir,
+				env: {
+					...process.env,
+					LH_AUTH_FILE: authFile,
+					FAKE_ACP_RECORD_EVENTS: "1",
+					FAKE_ACP_STREAM_MODE: streamMode,
+				},
+			});
+			const events = await collectEvents(
+				streamFn(
+					testModel(),
+					normalizeContext({
+						systemPrompt: "Probe.",
+						messages: [{ role: "user", content: "Start", timestamp: 1 }],
+						tools: [],
+					}),
+					{ reasoning: "high", sessionId: `chat-agy-${streamMode}` },
+				),
+			);
+			const end = events.at(-1) as Extract<AssistantMessageEvent, { type: "error" }>;
+			assert.equal(end.type, "error");
+			assert.equal(end.reason, "error");
+			assert.equal(end.error.stopReason, "error");
+			assert.match(end.error.errorMessage ?? "", /thinking only/i);
+			assert.ok(end.error.content.some((b) => b.type === "thinking"));
+			assert.equal(end.error.usage.totalTokens, 100);
+
+			const historyLines = fs.readFileSync(historyPath, "utf8").trim().split("\n");
+			assert.equal(historyLines.length, 2, `${streamMode} must nudge at most once`);
+		}
+	} finally {
+		await shutdownAntigravityProcesses();
 		fs.rmSync(root, { recursive: true, force: true });
 	}
 });

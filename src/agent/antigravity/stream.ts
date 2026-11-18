@@ -26,6 +26,7 @@ import {
 	spawnAcpClient,
 	type AcpClient,
 	type AcpConfigOption,
+	type AcpPermissionRequestParams,
 	type AcpPromptResponse,
 	type AcpSessionUpdate,
 } from "./acp-client.ts";
@@ -51,15 +52,43 @@ import {
 } from "./profile.ts";
 import { configurationForReuse, conversationForReuse } from "./reuse-context.ts";
 import {
+	ANTIGRAVITY_MCP_SERVER_NAME,
 	createAntigravityToolBridge,
 	type AntigravityPendingToolCall,
 	type AntigravityToolBridge,
 } from "./tool-bridge.ts";
+import {
+	EMPTY_RESPONSE_ERROR_MESSAGE,
+	EMPTY_RESPONSE_RETRY_PROMPT,
+	isEmptyThinkingOnlyStop,
+} from "../empty-response-guard.ts";
 import { toAntigravityPromptBlocks } from "./transcript.ts";
 
 export { shutdownAntigravityProcesses, toAntigravityPromptBlocks };
 
 const ABORT_MESSAGE = "Request was aborted";
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Authorizes `session/request_permission` strictly for declared tools on
+ *  LearnHarness's own loopback MCP server (`learnharness`), denying native
+ *  Antigravity tools, undeclared tool names, and external MCP servers. */
+export function isDeclaredLearnHarnessMcpPermission(
+	params: AcpPermissionRequestParams,
+	declaredToolNames: ReadonlySet<string>,
+	expectedSessionId?: string | null,
+): boolean {
+	if (expectedSessionId && typeof params.sessionId === "string" && params.sessionId !== expectedSessionId) {
+		return false;
+	}
+	const meta = isPlainRecord(params.toolCall?._meta) ? params.toolCall._meta : null;
+	if (!meta || meta.is_mcp_tool_call !== true) return false;
+	const mcp = isPlainRecord(meta.mcp) ? meta.mcp : null;
+	if (!mcp || mcp.server !== ANTIGRAVITY_MCP_SERVER_NAME) return false;
+	return typeof mcp.tool === "string" && declaredToolNames.has(mcp.tool);
+}
 
 function createOutput(model: Model<Api>): AssistantMessage & Pick<LhMessage, "cliContextWindow"> {
 	return {
@@ -112,6 +141,7 @@ class AcpTurn {
 	started = false;
 	finished = false;
 	lastError: string | null = null;
+	private lastUsageUpdateUsed = 0;
 
 	constructor(
 		private readonly stream: AssistantMessageEventStream,
@@ -223,8 +253,13 @@ class AcpTurn {
 					this.output.cliContextWindow = Math.round(size);
 				}
 				const used = update.used;
-				if (typeof used === "number" && Number.isFinite(used) && used >= 0 && this.output.usage.totalTokens === 0) {
-					this.output.usage.totalTokens = Math.round(used);
+				if (typeof used === "number" && Number.isFinite(used) && used > 0) {
+					const rounded = Math.round(used);
+					this.lastUsageUpdateUsed = rounded;
+					// MCP tool-use steps finish via admit() before session/prompt returns PromptResponse.usage.
+					// Populate usage.input so measuredContextTokens and turns logs reflect single-call context size.
+					this.output.usage.input = rounded;
+					this.output.usage.totalTokens = rounded;
 				}
 				return;
 			}
@@ -277,24 +312,32 @@ class AcpTurn {
 		this.stream.end();
 	}
 
-	finishPrompt(response: AcpPromptResponse): void {
-		if (this.finished) return;
-		this.start();
-		this.closeActiveBlock();
+	prepareForRetry(): void {
+		if (!this.finished) {
+			this.closeActiveBlock();
+		}
+	}
 
-		if (response.usage) {
-			const u = response.usage;
-			const input = typeof u.inputTokens === "number" && Number.isFinite(u.inputTokens) ? u.inputTokens : 0;
-			const output = typeof u.outputTokens === "number" && Number.isFinite(u.outputTokens) ? u.outputTokens : 0;
-			const cacheRead =
-				typeof u.cachedReadTokens === "number" && Number.isFinite(u.cachedReadTokens) ? u.cachedReadTokens : 0;
-			const cacheWrite =
-				typeof u.cachedWriteTokens === "number" && Number.isFinite(u.cachedWriteTokens) ? u.cachedWriteTokens : 0;
-			const thought = typeof u.thoughtTokens === "number" && Number.isFinite(u.thoughtTokens) ? u.thoughtTokens : 0;
+	applyPromptUsage(response: AcpPromptResponse): void {
+		if (!response.usage) return;
+		const u = response.usage;
+		// agy_acp_server reports uncached prompt_token_count in inputTokens (already disjoint from cachedReadTokens).
+		const input = typeof u.inputTokens === "number" && Number.isFinite(u.inputTokens) ? u.inputTokens : 0;
+		const output = typeof u.outputTokens === "number" && Number.isFinite(u.outputTokens) ? u.outputTokens : 0;
+		const cacheRead =
+			typeof u.cachedReadTokens === "number" && Number.isFinite(u.cachedReadTokens) ? u.cachedReadTokens : 0;
+		const cacheWrite =
+			typeof u.cachedWriteTokens === "number" && Number.isFinite(u.cachedWriteTokens) ? u.cachedWriteTokens : 0;
+		const thought = typeof u.thoughtTokens === "number" && Number.isFinite(u.thoughtTokens) ? u.thoughtTokens : 0;
+		const bucketSum = input + output + cacheRead + cacheWrite;
+		// PromptResponse.usage is cumulative across all model calls since session/prompt started, whereas
+		// usage_update.used reports the single latest call's context usage. If bucketSum exceeds lastUsageUpdateUsed,
+		// PromptResponse spans multiple calls; keep the single-call usage_update measurement for Context (last call).
+		if (this.lastUsageUpdateUsed === 0 || bucketSum <= this.lastUsageUpdateUsed) {
 			const total =
 				typeof u.totalTokens === "number" && Number.isFinite(u.totalTokens)
 					? u.totalTokens
-					: input + output + cacheRead + cacheWrite + thought;
+					: bucketSum + thought;
 			this.output.usage = {
 				input,
 				output,
@@ -304,6 +347,13 @@ class AcpTurn {
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			};
 		}
+	}
+
+	finishPrompt(response: AcpPromptResponse): void {
+		if (this.finished) return;
+		this.start();
+		this.closeActiveBlock();
+		this.applyPromptUsage(response);
 
 		const mapped = mapStopReason(response.stopReason);
 		if (mapped === "aborted") {
@@ -387,6 +437,7 @@ class AcpSessionProcess implements LiveAntigravityProcess {
 		const bridge = await createAntigravityToolBridge(tools, {
 			onCall: () => this.flushAdmissions(),
 			onError: (err) => this.fail(err.message),
+			onCancel: (call) => this.handleCancelledToolCall(call),
 		});
 		if (this.stopping || this.closed) {
 			await bridge.close().catch(() => {});
@@ -404,6 +455,7 @@ class AcpSessionProcess implements LiveAntigravityProcess {
 		});
 
 		let latestConfigOptions: AcpConfigOption[] | undefined;
+		const declaredToolNames = new Set(tools.map((tool) => tool.name));
 
 		const client = spawnAcpClient({
 			cwd,
@@ -411,6 +463,8 @@ class AcpSessionProcess implements LiveAntigravityProcess {
 			runtime: input.runtime,
 			platform: this.platform,
 			spawnProcess: input.spawnProcess,
+			approvePermission: (params) =>
+				isDeclaredLearnHarnessMcpPermission(params, declaredToolNames, this.acpSessionId),
 			onSessionUpdate: (_sid, update) => {
 				if (update.sessionUpdate === "config_option_update" && Array.isArray(update.configOptions)) {
 					latestConfigOptions = update.configOptions;
@@ -429,6 +483,16 @@ class AcpSessionProcess implements LiveAntigravityProcess {
 								? update.error
 								: "Antigravity reported a stream error.";
 					this.fail(formatAntigravityError(raw, client.stderrTail(), this.platform));
+					return;
+				}
+				if (
+					this.turn.finished &&
+					this.admitted.length > 0 &&
+					(update.sessionUpdate === "agent_thought_chunk" || update.sessionUpdate === "agent_message_chunk")
+				) {
+					// Antigravity moved on with model generation instead of honoring the held MCP call wait.
+					// Kill and unpark immediately so the next turn cold-starts cleanly with transcript replay.
+					void this.kill();
 					return;
 				}
 				this.turn.handleSessionUpdate(update, client.stderrTail());
@@ -500,12 +564,30 @@ class AcpSessionProcess implements LiveAntigravityProcess {
 			}
 			if (this.stopping) return;
 
-			const response = await client.prompt(sessionResult.sessionId, promptBlocks);
+			let response = await client.prompt(sessionResult.sessionId, promptBlocks);
 			if (this.stopping) return;
 
+			if (!this.turn.finished && isEmptyThinkingOnlyStop(mapStopReason(response.stopReason), this.turn.getMessage())) {
+				this.turn.prepareForRetry();
+				response = await client.prompt(sessionResult.sessionId, [
+					{ type: "text", text: EMPTY_RESPONSE_RETRY_PROMPT },
+				]);
+				if (this.stopping) return;
+			}
+
 			if (!this.turn.finished) {
-				this.turn.finishPrompt(response);
-				await this.cleanup();
+				if (isEmptyThinkingOnlyStop(mapStopReason(response.stopReason), this.turn.getMessage())) {
+					this.turn.applyPromptUsage(response);
+					this.turn.fail(EMPTY_RESPONSE_ERROR_MESSAGE, "error");
+					await this.cleanup();
+				} else {
+					this.turn.finishPrompt(response);
+					await this.cleanup();
+				}
+			} else if (this.admitted.length > 0) {
+				// Antigravity ended the prompt while LearnHarness was parked waiting on admitted tool results.
+				// Tear down instead of caching completedResponse so the next turn cold-starts cleanly with replay.
+				await this.kill();
 			} else {
 				// Prompt completed right while handing off a tool batch or parked; keep response for continuation.
 				this.completedResponse = response;
@@ -583,6 +665,15 @@ class AcpSessionProcess implements LiveAntigravityProcess {
 		}
 
 		this.flushAdmissions();
+	}
+
+	private handleCancelledToolCall(call: AntigravityPendingToolCall): void {
+		if (this.stopping || this.closed) return;
+		if (this.admitted.some((admittedCall) => admittedCall.id === call.id)) {
+			// The MCP HTTP call was cancelled or timed out on Antigravity's side while parked;
+			// unpark and terminate so the next turn replays the tool result into a fresh ACP session.
+			void this.kill();
+		}
 	}
 
 	flushAdmissions(): void {

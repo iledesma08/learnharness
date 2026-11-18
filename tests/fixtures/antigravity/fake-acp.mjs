@@ -162,7 +162,7 @@ async function parseMcpResponseBody(response) {
 	return lastJson;
 }
 
-async function callMcpJsonRpc(url, authHeader, sessionId, payload) {
+async function callMcpJsonRpc(url, authHeader, sessionId, payload, signal) {
 	const headers = {
 		"Content-Type": "application/json",
 		Accept: "application/json, text/event-stream",
@@ -173,6 +173,7 @@ async function callMcpJsonRpc(url, authHeader, sessionId, payload) {
 		method: "POST",
 		headers,
 		body: JSON.stringify(payload),
+		...(signal ? { signal } : {}),
 	});
 	const nextSessionId = res.headers.get("mcp-session-id") ?? sessionId;
 	const body = await parseMcpResponseBody(res);
@@ -479,9 +480,12 @@ rl.on("line", (line) => {
 		}
 
 		const promptBlocks = Array.isArray(msg.params?.prompt) ? msg.params.prompt : [];
+		session.promptCount = (session.promptCount ?? 0) + 1;
+		const promptNumber = session.promptCount;
 		const promptRecord = {
 			pid: process.pid,
 			sessionId,
+			promptNumber,
 			currentModel: session.currentModel,
 			currentThought: session.currentThought,
 			prompt: promptBlocks,
@@ -527,6 +531,47 @@ rl.on("line", (line) => {
 				return;
 			}
 
+			if (streamMode === "thinking-only-always" || streamMode === "thinking-whitespace-only") {
+				emitSessionUpdate(sessionId, {
+					sessionUpdate: "agent_thought_chunk",
+					content: { type: "text", text: `Silent thought #${promptNumber}.` },
+				});
+				if (streamMode === "thinking-whitespace-only") {
+					emitSessionUpdate(sessionId, {
+						sessionUpdate: "agent_message_chunk",
+						content: { type: "text", text: "   \n  " },
+					});
+				}
+				writeOut({
+					jsonrpc: "2.0",
+					id: msg.id,
+					result: {
+						stopReason: "end_turn",
+						usage: { inputTokens: 80, outputTokens: 20, thoughtTokens: 20, totalTokens: 100 },
+					},
+				});
+				return;
+			}
+
+			if (
+				(streamMode === "thinking-only-then-text" || streamMode === "thinking-only-then-mcp-tool") &&
+				promptNumber === 1
+			) {
+				emitSessionUpdate(sessionId, {
+					sessionUpdate: "agent_thought_chunk",
+					content: { type: "text", text: "Planning first attempt silently." },
+				});
+				writeOut({
+					jsonrpc: "2.0",
+					id: msg.id,
+					result: {
+						stopReason: "end_turn",
+						usage: { inputTokens: 60, outputTokens: 15, thoughtTokens: 15, totalTokens: 75 },
+					},
+				});
+				return;
+			}
+
 			if (streamMode === "hang-for-cancel") {
 				emitSessionUpdate(sessionId, {
 					sessionUpdate: "agent_thought_chunk",
@@ -567,7 +612,11 @@ rl.on("line", (line) => {
 			}
 
 			if (
-				(streamMode === "mcp-tool" || streamMode === "two-mcp-tools") &&
+				(streamMode === "mcp-tool" ||
+					streamMode === "two-mcp-tools" ||
+					streamMode === "mcp-tool-timeout-and-retry" ||
+					streamMode === "mcp-tool-move-on" ||
+					streamMode === "thinking-only-then-mcp-tool") &&
 				!(process.env.FAKE_ACP_TEXT_ON_REPLAY === "1" && isReplayPrompt)
 			) {
 				const server = session.mcpServers[0];
@@ -663,10 +712,109 @@ rl.on("line", (line) => {
 					return;
 				}
 
+				if (streamMode === "mcp-tool-timeout-and-retry") {
+					const ac = new AbortController();
+					setTimeout(() => ac.abort(), 40);
+					await callMcpJsonRpc(
+						server.url,
+						authHeader,
+						initRes.sessionId,
+						{
+							jsonrpc: "2.0",
+							id: 10,
+							method: "tools/call",
+							params: { name: "ask_user_question", arguments: { question: "Initial question" } },
+						},
+						ac.signal,
+					).catch(() => {});
+					// Simulate ACP timing out the held call and internally retrying + finishing.
+					void callMcpJsonRpc(server.url, authHeader, initRes.sessionId, {
+						jsonrpc: "2.0",
+						id: 11,
+						method: "tools/call",
+						params: { name: "ask_user_question", arguments: { question: "Initial question" } },
+					}).catch(() => {});
+					emitSessionUpdate(sessionId, {
+						sessionUpdate: "agent_message_chunk",
+						content: { type: "text", text: "Timed out waiting on MCP tool." },
+					});
+					writeOut({
+						jsonrpc: "2.0",
+						id: msg.id,
+						result: {
+							stopReason: "end_turn",
+							usage: { inputTokens: 200, cachedReadTokens: 50, outputTokens: 20, totalTokens: 220 },
+						},
+					});
+					return;
+				}
+
+				if (streamMode === "mcp-tool-move-on") {
+					void callMcpJsonRpc(server.url, authHeader, initRes.sessionId, {
+						jsonrpc: "2.0",
+						id: 10,
+						method: "tools/call",
+						params: { name: "ask_user_question", arguments: { question: "Ignored wait" } },
+					}).catch(() => {});
+					await new Promise((resolve) => setTimeout(resolve, 40));
+					emitSessionUpdate(sessionId, {
+						sessionUpdate: "agent_message_chunk",
+						content: { type: "text", text: "Moving on without waiting" },
+					});
+					writeOut({
+						jsonrpc: "2.0",
+						id: msg.id,
+						result: {
+							stopReason: "end_turn",
+							usage: { inputTokens: 200, cachedReadTokens: 50, outputTokens: 20, totalTokens: 220 },
+						},
+					});
+					return;
+				}
+
 				const toolName = process.env.FAKE_ACP_TOOL_NAME ?? "probe_check";
 				const toolArgs = process.env.FAKE_ACP_TOOL_ARGS_JSON
 					? JSON.parse(process.env.FAKE_ACP_TOOL_ARGS_JSON)
 					: { query: "status" };
+				if (process.env.FAKE_ACP_REQUIRE_MCP_PERMISSION === "1") {
+					const permResponse = await sendClientRequest("session/request_permission", {
+						sessionId,
+						toolCall: {
+							toolCallId: `mcp-perm-${toolName}`,
+							title: `learnharness_${toolName}`,
+							kind: "other",
+							status: "pending",
+							_meta: {
+								is_mcp_tool_call: true,
+								mcp: {
+									server: process.env.FAKE_ACP_MCP_SERVER_NAME ?? "learnharness",
+									tool: toolName,
+								},
+							},
+						},
+						options: [
+							{ optionId: "allow_always", name: "Allow Always", kind: "allow_always" },
+							{ optionId: "allow", name: "Allow", kind: "allow_once" },
+							{ optionId: "deny", name: "Deny", kind: "reject_once" },
+						],
+					});
+					recordArtifact("last-permission-response.json", permResponse);
+					if (permResponse?.result?.outcome?.outcome !== "selected") {
+						emitSessionUpdate(sessionId, {
+							sessionUpdate: "agent_message_chunk",
+							content: { type: "text", text: `mcp-permission:${permResponse?.result?.outcome?.outcome ?? "unknown"}` },
+						});
+						writeOut({
+							jsonrpc: "2.0",
+							id: msg.id,
+							result: {
+								stopReason: "end_turn",
+								usage: { inputTokens: 15, outputTokens: 5, totalTokens: 20 },
+							},
+						});
+						return;
+					}
+				}
 				const callRes = await callMcpJsonRpc(server.url, authHeader, initRes.sessionId, {
 					jsonrpc: "2.0",
 					id: 4,
@@ -724,19 +872,22 @@ rl.on("line", (line) => {
 					size: Number(process.env.FAKE_ACP_CLI_WINDOW),
 				});
 			}
-			writeOut({
-				jsonrpc: "2.0",
-				id: msg.id,
-				result: {
-					stopReason: "end_turn",
-					usage: {
+			const usagePayload = process.env.FAKE_ACP_USAGE_JSON
+				? JSON.parse(process.env.FAKE_ACP_USAGE_JSON)
+				: {
 						inputTokens: 100,
 						outputTokens: 25,
 						thoughtTokens: 15,
 						cachedReadTokens: 20,
 						cachedWriteTokens: 5,
 						totalTokens: 140,
-					},
+					};
+			writeOut({
+				jsonrpc: "2.0",
+				id: msg.id,
+				result: {
+					stopReason: "end_turn",
+					usage: usagePayload,
 				},
 			});
 		})();
