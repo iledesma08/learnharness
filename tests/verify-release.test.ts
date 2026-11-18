@@ -158,6 +158,7 @@ describe("release gate — packaging-config drift guard", () => {
 	});
 
 	const drifts: Array<[string, (config: Record<string, unknown>) => void]> = [
+		["AppImage toolset", (config) => { config.toolsets = { appimage: "0.0.0" }; }],
 		["linux artifactName", (config) => { (config.linux as Record<string, unknown>).artifactName = "${name}-${version}-${arch}.${ext}"; }],
 		["win artifactName", (config) => { (config.win as Record<string, unknown>).artifactName = "${productName}-${version}-setup.${ext}"; }],
 		["mac artifactName", (config) => { (config.mac as Record<string, unknown>).artifactName = "${productName}-${version}.${ext}"; }],
@@ -176,7 +177,7 @@ describe("release gate — packaging-config drift guard", () => {
 			const pkg = label === "package name" ? { ...realPkg, name: "other" } : realPkg;
 			const verdict = verifyConfigAssumptions(config, pkg);
 			assert.ok(!verdict.ok);
-			assert.match(verdict.errors.join("\n"), /expected names no longer hold|would not land in the draft|no longer "learnharness"|productName is /);
+			assert.match(verdict.errors.join("\n"), /expected names no longer hold|would not land in the draft|no longer "learnharness"|productName is |toolsets\.appimage is /);
 		});
 	}
 });
